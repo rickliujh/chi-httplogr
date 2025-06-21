@@ -38,6 +38,7 @@ func RequestLogger(logger logr.Logger, o *Options) func(http.Handler) http.Handl
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			ctx := logr.NewContext(r.Context(), logger)
 			ctx = context.WithValue(ctx, ctxKeyLogKVs{}, &[]any{})
+			logger = logger.V(o.Visibility)
 
 			logReqBody := o.LogRequestBody != nil && o.LogRequestBody(r)
 			logRespBody := o.LogResponseBody != nil && o.LogResponseBody(r)
@@ -117,7 +118,7 @@ func RequestLogger(logger logr.Logger, o *Options) func(http.Handler) http.Handl
 				}
 
 				// Skip logging if the message level is below the logger's level or the minimum level specified in options
-				if logger.GetV() > lvl || lvl < o.Visibility {
+				if logger.GetV() > lvl {
 					return
 				}
 
@@ -168,9 +169,9 @@ func RequestLogger(logger logr.Logger, o *Options) func(http.Handler) http.Handl
 
 				msg := fmt.Sprintf("%s %s => HTTP %v (%v)", r.Method, r.URL, statusCode, duration)
 				if lvl == 0 { // error
-					logger.V(lvl).Error(nil, msg, logkvs...)
+					logger.Error(nil, msg, logkvs...)
 				} else {
-					logger.V(lvl).Info(msg, logkvs...)
+					logger.Info(msg, logkvs...)
 				}
 			}()
 
@@ -225,7 +226,7 @@ func nestKVs(kvs []any) map[string]any {
 }
 
 func getHeaderKVs(header http.Header, headers []string) []any {
-	kvs := make([]interface{}, 0, len(headers))
+	kvs := make([]any, 0, len(headers))
 	for _, h := range headers {
 		vals := header.Values(h)
 		if len(vals) == 1 {
