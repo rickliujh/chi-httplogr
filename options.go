@@ -1,19 +1,16 @@
 package httplog
 
 import (
-	"log/slog"
 	"net/http"
 )
 
 type Options struct {
-	// Level defines the verbosity of the request logs:
-	// slog.LevelDebug - log both request starts & responses (incl. OPTIONS)
-	// slog.LevelInfo  - log responses (excl. OPTIONS)
-	// slog.LevelWarn  - log 4xx and 5xx responses only (except for 429)
-	// slog.LevelError - log 5xx responses only
-	//
-	// You can override the level with a custom slog.Handler (e.g. on per-request basis).
-	Level slog.Level
+	// Visibility defines the verbosity of the request logs:
+	// -3 Debug - log both request starts & responses (incl. OPTIONS)
+	// -2 Info  - log responses (excl. OPTIONS)
+	// -1 Warn  - log 4xx and 5xx responses only (except for 429)
+	// 0 Error - log 5xx responses only
+	Visibility int
 
 	// Schema defines the mapping of semantic log fields to their corresponding
 	// field names in different logging systems and standards.
@@ -94,11 +91,11 @@ type Options struct {
 	// }
 	//
 	// WARNING: Be careful not to leak any sensitive information in the logs.
-	LogExtraAttrs func(req *http.Request, reqBody string, respStatus int) []slog.Attr
+	LogExtraAttrs func(req *http.Request, reqBody string, respStatus int) []any
 }
 
 var defaultOptions = Options{
-	Level:               slog.LevelInfo,
+	Visibility:          0,
 	Schema:              SchemaECS,
 	RecoverPanics:       true,
 	LogRequestHeaders:   []string{"Content-Type", "Origin"},

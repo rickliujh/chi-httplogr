@@ -6,20 +6,20 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"runtime"
 	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/go-logr/logr"
 )
 
 var (
 	ErrClientAborted = fmt.Errorf("request aborted: client disconnected before response was sent")
 )
 
-func RequestLogger(logger *slog.Logger, o *Options) func(http.Handler) http.Handler {
+func RequestLogger(logger logr.Logger, o *Options) func(http.Handler) http.Handler {
 	if o == nil {
 		o = &defaultOptions
 	}
@@ -36,7 +36,8 @@ func RequestLogger(logger *slog.Logger, o *Options) func(http.Handler) http.Hand
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			ctx := context.WithValue(r.Context(), ctxKeyLogAttrs{}, &[]slog.Attr{})
+			ctx := logr.NewContext(r.Context(), logger)
+			ctx = context.WithValue(ctx, ctxKeyLogKVs{}, &[]any{})
 
 			logReqBody := o.LogRequestBody != nil && o.LogRequestBody(r)
 			logRespBody := o.LogResponseBody != nil && o.LogResponseBody(r)
@@ -56,7 +57,7 @@ func RequestLogger(logger *slog.Logger, o *Options) func(http.Handler) http.Hand
 			start := time.Now()
 
 			defer func() {
-				var logAttrs []slog.Attr
+				var logkvs []any
 
 				if rec := recover(); rec != nil {
 					// Return HTTP 500 if recover is enabled and no response status was set.
@@ -69,7 +70,7 @@ func RequestLogger(logger *slog.Logger, o *Options) func(http.Handler) http.Hand
 						defer panic(rec)
 					}
 
-					logAttrs = appendAttrs(logAttrs, slog.String(s.ErrorMessage, fmt.Sprintf("panic: %v", rec)))
+					logkvs = appendKVs(logkvs, s.ErrorMessage, fmt.Sprintf("panic: %v", rec))
 
 					if rec != http.ErrAbortHandler {
 						pc := make([]uintptr, 10)   // Capture up to 10 stack frames.
@@ -84,7 +85,7 @@ func RequestLogger(logger *slog.Logger, o *Options) func(http.Handler) http.Hand
 								stackValues = append(stackValues, fmt.Sprintf("%s:%d", frame.File, frame.Line))
 							}
 						}
-						logAttrs = appendAttrs(logAttrs, slog.Any(s.ErrorStackTrace, stackValues))
+						logkvs = appendKVs(logkvs, s.ErrorStackTrace, stackValues)
 					}
 				}
 
@@ -101,72 +102,76 @@ func RequestLogger(logger *slog.Logger, o *Options) func(http.Handler) http.Hand
 					return
 				}
 
-				var lvl slog.Level
+				var lvl int
 				switch {
 				case statusCode >= 500:
-					lvl = slog.LevelError
+					lvl = 0 // error
 				case statusCode == 429:
-					lvl = slog.LevelInfo
+					lvl = -2 // info
 				case statusCode >= 400:
-					lvl = slog.LevelWarn
+					lvl = -1 // warning
 				case r.Method == "OPTIONS":
-					lvl = slog.LevelDebug
+					lvl = -3 // debug
 				default:
-					lvl = slog.LevelInfo
+					lvl = -2
 				}
 
 				// Skip logging if the message level is below the logger's level or the minimum level specified in options
-				if !logger.Enabled(ctx, lvl) || lvl < o.Level {
+				if logger.GetV() > lvl || lvl < o.Visibility {
 					return
 				}
 
-				logAttrs = appendAttrs(logAttrs,
-					slog.String(s.RequestURL, requestURL(r)),
-					slog.String(s.RequestMethod, r.Method),
-					slog.String(s.RequestPath, r.URL.Path),
-					slog.String(s.RequestRemoteIP, r.RemoteAddr),
-					slog.String(s.RequestHost, r.Host),
-					slog.String(s.RequestScheme, scheme(r)),
-					slog.String(s.RequestProto, r.Proto),
-					slog.Any(s.RequestHeaders, slog.GroupValue(getHeaderAttrs(r.Header, o.LogRequestHeaders)...)),
-					slog.Int64(s.RequestBytes, r.ContentLength),
-					slog.String(s.RequestUserAgent, r.UserAgent()),
-					slog.String(s.RequestReferer, r.Referer()),
-					slog.Any(s.ResponseHeaders, slog.GroupValue(getHeaderAttrs(ww.Header(), o.LogResponseHeaders)...)),
-					slog.Int(s.ResponseStatus, statusCode),
-					slog.Float64(s.ResponseDuration, float64(duration.Milliseconds())),
-					slog.Int(s.ResponseBytes, ww.BytesWritten()),
+				logkvs = appendKVs(logkvs,
+					s.RequestURL, requestURL(r),
+					s.RequestMethod, r.Method,
+					s.RequestPath, r.URL.Path,
+					s.RequestRemoteIP, r.RemoteAddr,
+					s.RequestHost, r.Host,
+					s.RequestScheme, scheme(r),
+					s.RequestProto, r.Proto,
+					s.RequestHeaders, nestKVs(getHeaderKVs(r.Header, o.LogRequestHeaders)),
+					s.RequestBytes, r.ContentLength,
+					s.RequestUserAgent, r.UserAgent(),
+					s.RequestReferer, r.Referer(),
+					s.ResponseHeaders, nestKVs(getHeaderKVs(ww.Header(), o.LogResponseHeaders)),
+					s.ResponseStatus, statusCode,
+					s.ResponseDuration, float64(duration.Milliseconds()),
+					s.ResponseBytes, ww.BytesWritten(),
 				)
 
 				if err := ctx.Err(); errors.Is(err, context.Canceled) {
-					logAttrs = appendAttrs(logAttrs, slog.Any(ErrorKey, ErrClientAborted), slog.String(s.ErrorType, "ClientAborted"))
+					logkvs = appendKVs(logkvs, ErrorKey, ErrClientAborted, s.ErrorType, "ClientAborted")
 				}
 
 				if logReqBody || o.LogExtraAttrs != nil {
 					// Ensure the request body is fully read if the underlying HTTP handler didn't do so.
 					n, _ := io.Copy(io.Discard, r.Body)
 					if n > 0 {
-						logAttrs = appendAttrs(logAttrs, slog.Any(s.RequestBytesUnread, n))
+						logkvs = appendKVs(logkvs, s.RequestBytesUnread, n)
 					}
 				}
 				if logReqBody {
-					logAttrs = appendAttrs(logAttrs, slog.String(s.RequestBody, logBody(&reqBody, r.Header, o)))
+					logkvs = appendKVs(logkvs, s.RequestBody, logBody(&reqBody, r.Header, o))
 				}
 				if logRespBody {
-					logAttrs = appendAttrs(logAttrs, slog.String(s.ResponseBody, logBody(&respBody, ww.Header(), o)))
+					logkvs = appendKVs(logkvs, s.ResponseBody, logBody(&respBody, ww.Header(), o))
 				}
 				if o.LogExtraAttrs != nil {
-					logAttrs = appendAttrs(logAttrs, o.LogExtraAttrs(r, reqBody.String(), statusCode)...)
+					logkvs = appendKVs(logkvs, o.LogExtraAttrs(r, reqBody.String(), statusCode)...)
 				}
-				logAttrs = appendAttrs(logAttrs, getAttrs(ctx)...)
+				logkvs = appendKVs(logkvs, getKVs(ctx)...)
 
 				// Group attributes into nested objects, e.g. for GCP structured logs.
 				if s.GroupDelimiter != "" {
-					logAttrs = groupAttrs(logAttrs, s.GroupDelimiter)
+					logkvs = groupKVs(logkvs, s.GroupDelimiter)
 				}
 
 				msg := fmt.Sprintf("%s %s => HTTP %v (%v)", r.Method, r.URL, statusCode, duration)
-				logger.LogAttrs(ctx, lvl, msg, logAttrs...)
+				if lvl == 0 { // error
+					logger.V(lvl).Error(nil, msg, logkvs...)
+				} else {
+					logger.V(lvl).Info(msg, logkvs...)
+				}
 			}()
 
 			next.ServeHTTP(ww, r.WithContext(ctx))
@@ -174,46 +179,62 @@ func RequestLogger(logger *slog.Logger, o *Options) func(http.Handler) http.Hand
 	}
 }
 
-func appendAttrs(attrs []slog.Attr, newAttrs ...slog.Attr) []slog.Attr {
-	for _, attr := range newAttrs {
-		if attr.Key != "" {
-			attrs = append(attrs, attr)
-		}
-	}
-	return attrs
+func appendKVs(kvpairs []any, newkvs ...any) []any {
+	kvpairs = append(kvpairs, newkvs...)
+	return kvpairs
 }
 
-func groupAttrs(attrs []slog.Attr, delimiter string) []slog.Attr {
-	var result []slog.Attr
-	var nested = map[string][]slog.Attr{}
+func groupKVs(kvs []any, delimiter string) []any {
+	var result []any
+	var nested = map[string][]any{}
 
-	for _, attr := range attrs {
-		prefix, key, found := strings.Cut(attr.Key, delimiter)
-		if !found {
-			result = append(result, attr)
-			continue
+	for i, v := range kvs {
+		if i%2 == 0 {
+			str, ok := v.(string)
+			if !ok {
+				str = ""
+			}
+			prefix, key, found := strings.Cut(str, delimiter)
+			if !found {
+				result = append(result, str)
+				continue
+			}
+			nested[prefix] = append(nested[prefix], key, kvs[i+1])
 		}
-		nested[prefix] = append(nested[prefix], slog.Attr{Key: key, Value: attr.Value})
 	}
 
-	for prefix, attrs := range nested {
-		result = append(result, slog.Any(prefix, slog.GroupValue(attrs...)))
+	for prefix, kvs := range nested {
+		result = append(result, prefix, nestKVs(kvs))
 	}
 
 	return result
 }
 
-func getHeaderAttrs(header http.Header, headers []string) []slog.Attr {
-	attrs := make([]slog.Attr, 0, len(headers))
+func nestKVs(kvs []any) map[string]any {
+	m := make(map[string]any, len(kvs)/2+1)
+	for i, v := range kvs {
+		if i%2 == 0 {
+			str, ok := v.(string)
+			if !ok {
+				str = ""
+			}
+			m[str] = kvs[i+1]
+		}
+	}
+	return m
+}
+
+func getHeaderKVs(header http.Header, headers []string) []any {
+	kvs := make([]interface{}, 0, len(headers))
 	for _, h := range headers {
 		vals := header.Values(h)
 		if len(vals) == 1 {
-			attrs = append(attrs, slog.String(h, vals[0]))
+			kvs = append(kvs, h, vals[0])
 		} else if len(vals) > 1 {
-			attrs = append(attrs, slog.Any(h, vals))
+			kvs = append(kvs, h, vals)
 		}
 	}
-	return attrs
+	return kvs
 }
 
 func logBody(body *bytes.Buffer, header http.Header, o *Options) string {
